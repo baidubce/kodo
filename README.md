@@ -2,6 +2,8 @@
 
 Kodo - 独立的 Docker 和 Kubernetes 容器管理工具。
 
+> **English Documentation**: [README_EN.md](README_EN.md)
+
 ## 功能特性
 
 - **Docker 管理**：启动、停止 Docker 容器，执行容器内命令
