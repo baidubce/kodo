@@ -59,8 +59,6 @@ class ProxyManager:
         proxy_vars = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 
                      'ftp_proxy', 'FTP_PROXY', 'no_proxy', 'NO_PROXY']
         
-        print("Temporarily disabling proxy for Kubernetes operations...")
-        
         for var in proxy_vars:
             if var in os.environ:
                 self.original_proxy_settings[var] = os.environ[var]
@@ -71,7 +69,6 @@ class ProxyManager:
     def _restore_proxy(self):
         """Restore original proxy settings."""
         if self.original_proxy_settings:
-            print("Restoring proxy settings...")
             for var, value in self.original_proxy_settings.items():
                 os.environ[var] = value
             self.original_proxy_settings.clear()
@@ -163,7 +160,7 @@ class DockerManager:
         workdir: Optional[str] = None
     ) -> Tuple[str, str]:
         """Execute a command in a Docker container with timeout."""
-        full_command = f"timeout {timeout} {command}"
+        full_command = command
         
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -372,7 +369,7 @@ class KubernetesManager:
     ) -> Tuple[str, str]:
         """Execute a command in a Kubernetes pod."""
         with ProxyManager(disable_proxy=self.disable_proxy):
-            full_command = ["/bin/sh", "-c", f"timeout {timeout} {command}"]
+            full_command = ["/bin/sh", "-c", f"{command}"]
             
             try:
                 def execute():
