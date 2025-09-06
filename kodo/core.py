@@ -272,6 +272,14 @@ class KubernetesManager:
                     "resources": default_resources,
                 }
             ],
+            "tolerations": [
+                {
+                    "effect": "NoSchedule",
+                    "key": "rl-training-only",
+                    "operator": "Equal",
+                    "value":  "true"
+                }
+            ],
         }
         
         # Add node selector if provided
