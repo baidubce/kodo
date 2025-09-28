@@ -225,14 +225,15 @@ class KubernetesManager:
         # Initialize Kubernetes client with proxy control
         with ProxyManager(disable_proxy=disable_proxy):
             try:
-                # Try in-cluster config first, fallback to kubeconfig
-                config.load_incluster_config()
-            except Exception:
                 # Load kubeconfig from specified path or default location
                 if kubeconfig_path:
+                    print(f"[KubernetesManager] Loading kubeconfig from {kubeconfig_path}")
                     config.load_kube_config(config_file=kubeconfig_path)
                 else:
+                    print(f"[KubernetesManager] Loading kubeconfig from default location")
                     config.load_kube_config()
+            except Exception:
+                raise Exception("Please provide `kubeconfig_path` params")
             
             self.client = client.CoreV1Api()
     
