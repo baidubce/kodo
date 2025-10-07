@@ -35,6 +35,9 @@ setup(
     install_requires=[
         "docker>=6.0.0",
         "kubernetes>=25.0.0",
+        "aiodocker>=0.21.0",
+        "kubernetes-asyncio>=24.2.0",
+        "aiofiles>=23.0.0",
     ],
     extras_require={
         "dev": [

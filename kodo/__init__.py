@@ -16,6 +16,9 @@ from .core import (
     DockerManager,
     KubernetesManager,
     ContainerRunner,
+    AsyncDockerManager,
+    AsyncKubernetesManager,
+    AsyncContainerRunner,
     DEFAULT_NAMESPACE,
     DEFAULT_DOCKER_PATH,
     DEFAULT_TIMEOUT,
@@ -34,6 +37,10 @@ __all__ = [
     "DockerManager",
     "KubernetesManager",
     "ContainerRunner",
+    # Async classes
+    "AsyncDockerManager",
+    "AsyncKubernetesManager",
+    "AsyncContainerRunner",
     # Utility functions
     "create_temp_file_with_content",
     "apply_patch_to_container",

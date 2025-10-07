@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import datetime
 import subprocess
+import asyncio
 import concurrent.futures
 from typing import Tuple, Dict, Optional, List, Any
 import re
@@ -23,6 +24,12 @@ import kubernetes
 from kubernetes import client, config, watch
 from kubernetes.stream import stream
 import time
+
+# Async imports
+import aiodocker
+from kubernetes_asyncio import client as async_client, config as async_config, watch as async_watch
+from kubernetes_asyncio.stream import WsApiClient
+import aiofiles
 
 # Constants
 DEFAULT_NAMESPACE = "default"
@@ -554,3 +561,503 @@ class ContainerRunner:
             self.manager.close()
         else:
             self.manager.cleanup()
+
+
+class AsyncDockerManager:
+    """Async Docker container management utilities."""
+    
+    def __init__(self, timeout: int = 120):
+        self.timeout = timeout
+        self.client = None
+        self.containers = {}
+    
+    async def __aenter__(self):
+        self.client = aiodocker.Docker()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+    
+    async def start_container(
+        self, 
+        image: str, 
+        command: str = "/bin/bash",
+        name: Optional[str] = None,
+        environment: Optional[Dict[str, str]] = None,
+        **kwargs
+    ):
+        if not self.client:
+            self.client = aiodocker.Docker()
+        
+        if name is None:
+            name = ContainerUtils.get_container_name(image)
+        
+        try:
+            containers = await self.client.containers.list(
+                all=True,
+                filters=json.dumps({"name": [name]})
+            )
+            
+            if containers:
+                container = containers[0]
+                info = await container.show()
+                if info['State']['Status'] != "running":
+                    await container.start()
+            else:
+                env = {"PATH": DEFAULT_DOCKER_PATH}
+                if environment:
+                    env.update(environment)
+                
+                env_list = [f"{k}={v}" for k, v in env.items()]
+                
+                config = {
+                    "Image": image,
+                    "Cmd": [command],
+                    "Tty": True,
+                    "OpenStdin": True,
+                    "AttachStdin": True,
+                    "AttachStdout": True,
+                    "AttachStderr": True,
+                    "Env": env_list,
+                    "HostConfig": kwargs.get("HostConfig", {})
+                }
+                
+                container = await self.client.containers.create(
+                    config=config,
+                    name=name
+                )
+                await container.start()
+            
+            self.containers[name] = container
+            return container
+            
+        except Exception as e:
+            print(f"Container start error: {repr(e)}")
+            raise
+    
+    async def stop_container(self, container_name: str):
+        try:
+            if container_name in self.containers:
+                container = self.containers[container_name]
+                await container.stop()
+                await container.delete()
+                del self.containers[container_name]
+        except Exception as e:
+            print(f"Container stop/delete error: {repr(e)}")
+    
+    async def execute_command(
+        self,
+        container,
+        command: str,
+        timeout: int = DEFAULT_TIMEOUT,
+        workdir: Optional[str] = None
+    ) -> Tuple[str, str]:
+        try:
+            exec_config = {
+                "Cmd": ["/bin/sh", "-c", command],
+                "AttachStdout": True,
+                "AttachStderr": True,
+                "Tty": False,
+                "WorkingDir": workdir or "",
+            }
+            
+            exec_obj = await container.exec(exec_config)
+            
+            async def run_exec():
+                output_chunks = []
+                async for chunk in exec_obj.start(detach=False):
+                    if chunk.stream == 1 or chunk.stream == 2:
+                        output_chunks.append(chunk.data.decode("utf-8", errors="replace"))
+                
+                inspect = await exec_obj.inspect()
+                exit_code = inspect.get("ExitCode", 0)
+                output = "".join(output_chunks)
+                return output, exit_code
+            
+            try:
+                output, exit_code = await asyncio.wait_for(run_exec(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return f"Command timed out (>{timeout}s)", "-1"
+            
+            if exit_code == 124:
+                return f"Command timed out (>{timeout}s)", "-1"
+            
+            if exit_code != 0:
+                return output, f"Error: Exit code {exit_code}"
+            
+            output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
+            return output, str(exit_code)
+            
+        except Exception as e:
+            return f"Error: {repr(e)}", "-1"
+    
+    async def copy_to_container(
+        self, 
+        container,
+        src_path: str, 
+        dest_path: str
+    ):
+        tar_stream = io.BytesIO()
+        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+            tar.add(src_path, arcname=os.path.basename(dest_path))
+        tar_stream.seek(0)
+        
+        await container.put_archive(
+            path=os.path.dirname(dest_path),
+            data=tar_stream.read()
+        )
+    
+    async def close(self):
+        for container_name in list(self.containers.keys()):
+            await self.stop_container(container_name)
+        
+        if self.client:
+            await self.client.close()
+
+
+class AsyncKubernetesManager:
+    """Async Kubernetes pod management utilities."""
+    
+    def __init__(self, namespace: str = DEFAULT_NAMESPACE, kubeconfig_path: Optional[str] = None, disable_proxy: bool = True):
+        self.namespace = namespace
+        self.kubeconfig_path = kubeconfig_path
+        self.disable_proxy = disable_proxy
+        self.pods = {}
+        self.client = None
+        self._initialized = False
+    
+    async def __aenter__(self):
+        await self._init_client()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.cleanup()
+        if self.client:
+            await self.client.api_client.close()
+    
+    async def _init_client(self):
+        if self._initialized:
+            return
+        
+        with ProxyManager(disable_proxy=self.disable_proxy):
+            try:
+                if self.kubeconfig_path:
+                    print(f"[AsyncKubernetesManager] Loading kubeconfig from {self.kubeconfig_path}")
+                    await async_config.load_kube_config(config_file=self.kubeconfig_path)
+                else:
+                    print(f"[AsyncKubernetesManager] Loading kubeconfig from default location")
+                    await async_config.load_kube_config()
+            except Exception:
+                raise Exception("Please provide `kubeconfig_path` params")
+            
+            self.client = async_client.CoreV1Api()
+            self._initialized = True
+    
+    def create_pod_spec(
+        self,
+        name: str,
+        image: str,
+        command: str,
+        environment: Optional[Dict[str, str]] = None,
+        resources: Optional[Dict[str, Any]] = None,
+        node_selector: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        env_vars = {"PATH": DEFAULT_DOCKER_PATH}
+        if environment:
+            env_vars.update(environment)
+        
+        env_spec = [{"name": k, "value": str(v)} for k, v in env_vars.items()]
+        
+        default_resources = {
+            "requests": {"cpu": "1", "memory": "1Gi"}
+        }
+        if resources:
+            default_resources.update(resources)
+        
+        pod_spec = {
+            "restartPolicy": "Never",
+            "containers": [
+                {
+                    "name": name,
+                    "image": image,
+                    "command": ["/bin/sh", "-c"],
+                    "args": [command] if isinstance(command, str) else command,
+                    "stdin": True,
+                    "tty": True,
+                    "env": env_spec,
+                    "resources": default_resources,
+                }
+            ],
+            "tolerations": [
+                {
+                    "effect": "NoSchedule",
+                    "key": "rl-training-only",
+                    "operator": "Equal",
+                    "value":  "true"
+                }
+            ],
+        }
+        
+        if node_selector:
+            pod_spec["nodeSelector"] = node_selector
+        
+        return {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name},
+            "spec": pod_spec,
+        }
+    
+    async def start_pod(
+        self,
+        name: str,
+        image: str,
+        command: str = "sleep infinity",
+        environment: Optional[Dict[str, str]] = None,
+        resources: Optional[Dict[str, Any]] = None,
+        node_selector: Optional[Dict[str, str]] = None,
+        max_retries: int = 5,
+        timeout: int = 1200
+    ):
+        await self._init_client()
+        
+        with ProxyManager(disable_proxy=self.disable_proxy):
+            try:
+                pod = await self.client.read_namespaced_pod(
+                    name=name, namespace=self.namespace, _request_timeout=60
+                )
+                self.pods[name] = pod
+                return pod
+            except async_client.ApiException as e:
+                if e.status != 404:
+                    raise
+            
+            pod_body = self.create_pod_spec(name, image, command, environment, resources, node_selector)
+            
+            backoff = 5
+            for attempt in range(1, max_retries + 1):
+                try:
+                    pod = await self.client.create_namespaced_pod(
+                        namespace=self.namespace, body=pod_body, _request_timeout=120
+                    )
+                    break
+                except async_client.ApiException as e:
+                    if e.status in (409, 429, 500, 503) and attempt < max_retries:
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 60)
+                        continue
+                    raise
+            else:
+                raise RuntimeError(f"Exceeded retry limit ({max_retries}) creating pod '{name}'")
+            
+            await self._wait_for_pod_running(name, timeout)
+            self.pods[name] = pod
+            return pod
+    
+    async def _wait_for_pod_running(self, pod_name: str, timeout: int = 1200):
+        with ProxyManager(disable_proxy=self.disable_proxy):
+            w = async_watch.Watch()
+            start_time = time.time()
+            
+            async for event in w.stream(
+                self.client.list_namespaced_pod,
+                namespace=self.namespace,
+                field_selector=f"metadata.name={pod_name}",
+                timeout_seconds=timeout,
+            ):
+                obj = event["object"]
+                phase = obj.status.phase
+                
+                if time.time() - start_time > timeout:
+                    w.stop()
+                    raise RuntimeError(f"Pod '{pod_name}' timed out after {timeout} seconds")
+                
+                if phase == "Running":
+                    w.stop()
+                    break
+                
+                if phase in ["Failed", "Succeeded", "Unknown"]:
+                    w.stop()
+                    raise RuntimeError(f"Pod '{pod_name}' entered terminal phase '{phase}'")
+    
+    async def execute_command(
+        self,
+        pod_name: str,
+        command: str,
+        timeout: int = DEFAULT_TIMEOUT
+    ) -> Tuple[str, str]:
+        await self._init_client()
+        
+        with ProxyManager(disable_proxy=self.disable_proxy):
+            full_command = ["/bin/sh", "-c", command]
+            
+            try:
+                ws_client = WsApiClient()
+                ws_api = async_client.CoreV1Api(api_client=ws_client)
+                
+                resp = await ws_api.connect_get_namespaced_pod_exec(
+                    pod_name,
+                    self.namespace,
+                    command=full_command,
+                    stderr=True,
+                    stdin=False,
+                    stdout=True,
+                    tty=False,
+                )
+                
+                await ws_client.close()
+                
+                output = resp if isinstance(resp, str) else ""
+                exit_code = 0
+                
+                output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
+                return output, str(exit_code)
+                
+            except Exception as e:
+                return f"Error: {repr(e)}", "-1"
+    
+    async def copy_to_pod(self, pod_name: str, src_path: str, dest_path: str):
+        await self._init_client()
+        
+        with ProxyManager(disable_proxy=self.disable_proxy):
+            dest_dir = os.path.dirname(dest_path)
+            tar_stream = io.BytesIO()
+            
+            with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+                tar.add(src_path, arcname=os.path.basename(dest_path))
+            tar_stream.seek(0)
+            
+            max_retries = 5
+            retry_delay = 5
+            
+            for attempt in range(max_retries):
+                try:
+                    exec_command = ["tar", "xmf", "-", "-C", dest_dir]
+                    await self.client.connect_get_namespaced_pod_exec(
+                        pod_name,
+                        self.namespace,
+                        command=exec_command,
+                        stderr=True,
+                        stdin=True,
+                        stdout=True,
+                        tty=False,
+                    )
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, 60)
+                        tar_stream.seek(0)
+                    else:
+                        raise
+    
+    async def delete_pod(self, pod_name: str, grace_period: int = 0):
+        await self._init_client()
+        
+        with ProxyManager(disable_proxy=self.disable_proxy):
+            try:
+                await self.client.delete_namespaced_pod(
+                    name=pod_name,
+                    namespace=self.namespace,
+                    body=async_client.V1DeleteOptions(grace_period_seconds=grace_period),
+                    _request_timeout=60,
+                )
+                
+                if pod_name in self.pods:
+                    del self.pods[pod_name]
+                    
+            except async_client.ApiException as e:
+                if e.status == 404:
+                    pass
+                else:
+                    raise
+    
+    async def cleanup(self):
+        for pod_name in list(self.pods.keys()):
+            try:
+                await self.delete_pod(pod_name)
+            except Exception as e:
+                print(f"Error deleting pod {pod_name}: {e}")
+
+
+class AsyncContainerRunner:
+    """High-level async interface for running containers with either Docker or Kubernetes."""
+    
+    def __init__(self, backend: str = "docker", **kwargs):
+        if backend not in ["docker", "kubernetes"]:
+            raise ValueError(f"Invalid backend: {backend}. Must be 'docker' or 'kubernetes'")
+        
+        self.backend = backend
+        self.kwargs = kwargs
+        self.manager = None
+        self._initialized = False
+    
+    async def __aenter__(self):
+        await self._init_manager()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.cleanup()
+    
+    async def _init_manager(self):
+        if self._initialized:
+            return
+        
+        if self.backend == "docker":
+            self.manager = AsyncDockerManager(**self.kwargs)
+            if not self.manager.client:
+                self.manager.client = aiodocker.Docker()
+        else:
+            self.manager = AsyncKubernetesManager(**self.kwargs)
+            await self.manager._init_client()
+        
+        self._initialized = True
+    
+    async def start_container(self, image: str, name: Optional[str] = None, **kwargs):
+        await self._init_manager()
+        
+        if name is None:
+            name = ContainerUtils.get_container_name(image)
+        
+        if self.backend == "docker":
+            docker_kwargs = {k: v for k, v in kwargs.items() if k not in ['node_selector']}
+            return await self.manager.start_container(image, name=name, **docker_kwargs)
+        else:
+            return await self.manager.start_pod(name, image, **kwargs)
+    
+    async def execute_command(self, container_ref, command: str, **kwargs) -> Tuple[str, str]:
+        await self._init_manager()
+        
+        if self.backend == "docker":
+            return await self.manager.execute_command(container_ref, command, **kwargs)
+        else:
+            pod_name = container_ref if isinstance(container_ref, str) else container_ref.metadata.name
+            return await self.manager.execute_command(pod_name, command, **kwargs)
+    
+    async def copy_to_container(self, container_ref, src_path: str, dest_path: str):
+        await self._init_manager()
+        
+        if self.backend == "docker":
+            await self.manager.copy_to_container(container_ref, src_path, dest_path)
+        else:
+            pod_name = container_ref if isinstance(container_ref, str) else container_ref.metadata.name
+            await self.manager.copy_to_pod(pod_name, src_path, dest_path)
+    
+    async def stop_container(self, container_ref):
+        await self._init_manager()
+        
+        if self.backend == "docker":
+            container_name = container_ref.name if hasattr(container_ref, 'name') else container_ref
+            await self.manager.stop_container(container_name)
+        else:
+            pod_name = container_ref if isinstance(container_ref, str) else container_ref.metadata.name
+            await self.manager.delete_pod(pod_name)
+    
+    async def cleanup(self):
+        if not self._initialized:
+            return
+        
+        if self.backend == "docker":
+            await self.manager.close()
+        else:
+            await self.manager.cleanup()
